@@ -1,10 +1,10 @@
 import streamlit as st
 import requests, feedparser, pytz, torch
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from transformers import AutoTokenizer, AutoModelForSequenceClassification
 from streamlit_autorefresh import st_autorefresh
 
-st.set_page_config(page_title="Nifty Sentiment Monitor", page_icon="📈", layout="wide")
+st.set_page_config(page_title="Shantanu's Market Update", page_icon="📈", layout="wide")
 
 IST = pytz.timezone("Asia/Kolkata")
 MODEL_NAME = "ProsusAI/finbert"
@@ -26,7 +26,36 @@ tokenizer, model = load_model()
 SCORE_MAP = {"positive": 1.0, "neutral": 0.0, "negative": -1.0}
 ID2LABEL = {0: "negative", 1: "neutral", 2: "positive"}
 
-@st.cache_data(ttl=600, show_spinner=False)
+
+def now_ist():
+    return datetime.now(IST)
+
+
+def fmt_ist(dt=None):
+    dt = dt or now_ist()
+    return dt.strftime("%d %b %Y, %I:%M %p IST")
+
+
+def parse_pub_dt(s):
+    if not s:
+        return None
+    for fmt in ("%Y-%m-%dT%H:%M:%SZ", "%Y-%m-%dT%H:%M:%S", "%a, %d %b %Y %H:%M:%S %z", "%a, %d %b %Y %H:%M:%S GMT"):
+        try:
+            dt = datetime.strptime(s[:25].strip(), fmt)
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            return dt.astimezone(IST)
+        except:
+            pass
+    return None
+
+
+def within_last_3_hours(article):
+    dt = parse_pub_dt(article.get("published", ""))
+    return dt is not None and dt >= now_ist() - timedelta(hours=3)
+
+
+@st.cache_data(ttl=300, show_spinner=False)
 def fetch_newsapi():
     try:
         r = requests.get(
@@ -36,19 +65,15 @@ def fetch_newsapi():
         )
         items = r.json().get("articles", [])
         return [
-            {
-                "title": a.get("title", ""),
-                "source": a.get("source", {}).get("name", "NewsAPI"),
-                "url": a.get("url", ""),
-                "published": a.get("publishedAt", ""),
-                "feed": "NewsAPI",
-            }
+            {"title": a.get("title", ""), "source": a.get("source", {}).get("name", "NewsAPI"),
+             "url": a.get("url", ""), "published": a.get("publishedAt", ""), "feed": "NewsAPI"}
             for a in items if a.get("title")
         ]
     except:
         return []
 
-@st.cache_data(ttl=600, show_spinner=False)
+
+@st.cache_data(ttl=300, show_spinner=False)
 def fetch_finnhub():
     try:
         r = requests.get(
@@ -71,7 +96,8 @@ def fetch_finnhub():
     except:
         return []
 
-@st.cache_data(ttl=600, show_spinner=False)
+
+@st.cache_data(ttl=300, show_spinner=False)
 def fetch_rss():
     feeds = [
         ("RBI", "https://www.rbi.org.in/RSS/RBIRSSFeed.aspx?Id=316"),
@@ -96,7 +122,8 @@ def fetch_rss():
             pass
     return results
 
-@st.cache_data(ttl=600, show_spinner=False)
+
+@st.cache_data(ttl=300, show_spinner=False)
 def fetch_freenews():
     try:
         r = requests.get(
@@ -106,25 +133,13 @@ def fetch_freenews():
         )
         items = r.json().get("articles", [])
         return [
-            {
-                "title": a.get("title", ""),
-                "source": a.get("source", {}).get("name", "FreeNews"),
-                "url": a.get("url", ""),
-                "published": a.get("publishedAt", ""),
-                "feed": "FreeNewsAPI",
-            }
+            {"title": a.get("title", ""), "source": a.get("source", {}).get("name", "FreeNews"),
+             "url": a.get("url", ""), "published": a.get("publishedAt", ""), "feed": "FreeNewsAPI"}
             for a in items if a.get("title")
         ]
     except:
         return []
 
-def parse_date(s):
-    for fmt in ("%Y-%m-%dT%H:%M:%SZ", "%Y-%m-%dT%H:%M:%S", "%a, %d %b %Y %H:%M:%S %z", "%a, %d %b %Y %H:%M:%S GMT"):
-        try:
-            return datetime.strptime(s[:25].strip(), fmt)
-        except:
-            pass
-    return datetime.min
 
 def dedupe(items):
     seen, out = set(), []
@@ -135,12 +150,20 @@ def dedupe(items):
             out.append(a)
     return out
 
+
+def load_all():
+    raw = fetch_newsapi() + fetch_finnhub() + fetch_rss() + fetch_freenews()
+    raw = dedupe(raw)
+    raw = [a for a in raw if within_last_3_hours(a)]
+    raw.sort(key=lambda x: parse_pub_dt(x.get("published", "")) or datetime.min.replace(tzinfo=IST), reverse=True)
+    return raw[:60]
+
+
 def score_articles(articles):
-    scores = []
+    scored = []
     with torch.no_grad():
         for a in articles:
-            text = a["title"][:512]
-            inputs = tokenizer(text, return_tensors="pt", truncation=True, max_length=512)
+            inputs = tokenizer(a["title"][:512], return_tensors="pt", truncation=True, max_length=512)
             logits = model(**inputs).logits[0]
             probs = torch.softmax(logits, dim=-1)
             idx = int(torch.argmax(probs).item())
@@ -149,22 +172,13 @@ def score_articles(articles):
             a["sentiment"] = label
             a["confidence"] = round(conf, 3)
             a["score"] = SCORE_MAP[label]
-            scores.append(a["score"])
-    return articles, scores
+            scored.append(a)
+    return scored
 
-def is_market_hours():
-    now = datetime.now(IST)
-    return now.weekday() < 5 and now.replace(hour=9, minute=15, second=0) <= now <= now.replace(hour=15, minute=30, second=0)
-
-def load_all():
-    raw = fetch_newsapi() + fetch_finnhub() + fetch_rss() + fetch_freenews()
-    raw = dedupe(raw)
-    raw.sort(key=lambda x: parse_date(x.get("published", "")), reverse=True)
-    return raw[:60]
 
 def refresh_logic():
-    arts = load_all()
-    arts, scores = score_articles(arts)
+    arts = score_articles(load_all())
+    scores = [a["score"] for a in arts]
     avg = round(sum(scores) / len(scores), 3) if scores else 0.0
     if avg > 0.15:
         overall = "Bullish"
@@ -174,27 +188,34 @@ def refresh_logic():
         overall = "Neutral"
     return arts, avg, overall
 
+
+if "owner_ok" not in st.session_state:
+    st.session_state.owner_ok = False
 if "prev_score" not in st.session_state:
     st.session_state.prev_score = 0.0
     st.session_state.prev_sentiment = None
     st.session_state.articles = []
     st.session_state.avg_score = 0.0
     st.session_state.overall = "Neutral"
-
-if "owner_ok" not in st.session_state:
-    st.session_state.owner_ok = False
-
-interval_ms = 10 * 60 * 1000 if is_market_hours() else 30 * 60 * 1000
-st_autorefresh(interval=interval_ms, key="refresh_timer")
+    st.session_state.change = "—"
+    st.session_state.last_updated = fmt_ist()
+if "refresh_minutes" not in st.session_state:
+    st.session_state.refresh_minutes = 10
 
 with st.sidebar:
     st.markdown("## Owner Mode")
     pwd = st.text_input("Password", type="password")
     if st.button("Unlock"):
         st.session_state.owner_ok = bool(OWNER_PASSWORD) and pwd == OWNER_PASSWORD
+
     if st.session_state.owner_ok:
         st.success("Owner mode enabled")
-        if st.button("Manual Refresh"):
+        st.session_state.refresh_minutes = st.selectbox(
+            "Auto-refresh frequency (minutes)",
+            [5, 10, 15, 30, 60],
+            index=[5, 10, 15, 30, 60].index(st.session_state.refresh_minutes),
+        )
+        if st.button("SOS Manual Refresh"):
             st.cache_data.clear()
             arts, avg, overall = refresh_logic()
             delta = round(avg - st.session_state.prev_score, 3)
@@ -208,9 +229,12 @@ with st.sidebar:
             st.session_state.change = change
             st.session_state.prev_score = avg
             st.session_state.prev_sentiment = overall
+            st.session_state.last_updated = fmt_ist()
             st.rerun()
     else:
         st.info("Read-only mode")
+
+st_autorefresh(interval=st.session_state.refresh_minutes * 60 * 1000, key="refresh_timer")
 
 st.markdown("""
 <style>
@@ -224,12 +248,11 @@ st.markdown("""
   .badge-bull { background:#ecfdf5; color:#15803d; }
   .badge-bear { background:#fef2f2; color:#b91c1c; }
   .badge-neut { background:#fffbeb; color:#b45309; }
-  a { text-decoration: none; }
 </style>
 """, unsafe_allow_html=True)
 
 if not st.session_state.articles:
-    with st.spinner("Loading latest news..."):
+    with st.spinner(f"LAST UPDATED AT: {st.session_state.last_updated}"):
         arts, avg, overall = refresh_logic()
         st.session_state.articles = arts
         st.session_state.avg_score = avg
@@ -237,6 +260,7 @@ if not st.session_state.articles:
         st.session_state.change = "Initial load"
         st.session_state.prev_score = avg
         st.session_state.prev_sentiment = overall
+        st.session_state.last_updated = fmt_ist()
 
 articles = st.session_state.articles
 avg = st.session_state.avg_score
@@ -246,34 +270,31 @@ bull = [a for a in articles if a["sentiment"] == "positive"]
 bear = [a for a in articles if a["sentiment"] == "negative"]
 neut = [a for a in articles if a["sentiment"] == "neutral"]
 
-st.title("Nifty Sentiment Monitor")
-st.caption(f"Auto-refresh: {'10 min' if is_market_hours() else '30 min'} | Mode: {'Owner' if st.session_state.owner_ok else 'Read-only'}")
+st.markdown("### Shantanu's Market Update")
+st.markdown(f"**LAST UPDATED AT:** {st.session_state.last_updated}")
+st.caption("All timestamps, notifications, and refresh events are shown in IST.")
 
 c1, c2, c3 = st.columns(3)
 c1.metric("Overall", overall)
 c2.metric("Score", f"{avg:+.3f}")
-c3.metric("Change", st.session_state.get("change", "—"))
+c3.metric("Change", st.session_state.change)
 
 st.write("### Latest Headlines")
 
-tabs = st.tabs([
-    f"All ({len(articles)})",
-    f"Bullish ({len(bull)})",
-    f"Neutral ({len(neut)})",
-    f"Bearish ({len(bear)})"
-])
+tabs = st.tabs([f"All ({len(articles)})", f"Bullish ({len(bull)})", f"Neutral ({len(neut)})", f"Bearish ({len(bear)})"])
 
 def render(items):
     for a in items:
         cls = "bull" if a["sentiment"] == "positive" else "bear" if a["sentiment"] == "negative" else "neut"
         badge = "badge-bull" if cls == "bull" else "badge-bear" if cls == "bear" else "badge-neut"
         icon = "▲" if cls == "bull" else "▼" if cls == "bear" else "●"
-        ts = a.get("published", "")[:19].replace("T", " ")
+        ts = parse_pub_dt(a.get("published", ""))
+        ts_txt = ts.strftime("%d %b %Y, %I:%M %p IST") if ts else "Time unavailable"
         st.markdown(f"""
         <div class="card {cls}">
           <a href="{a['url']}" target="_blank"><b>{a['title']}</b></a><br>
           <span class="badge {badge}">{icon} {a['sentiment']}</span>
-          <span style="margin-left:8px;color:#6b7280">{a['source']} · {a['feed']} · {ts} · conf {int(a['confidence']*100)}%</span>
+          <span style="margin-left:8px;color:#6b7280">{a['source']} · {a['feed']} · {ts_txt} · conf {int(a['confidence']*100)}%</span>
         </div>
         """, unsafe_allow_html=True)
 
