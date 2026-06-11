@@ -3,19 +3,31 @@ import requests
 import feedparser
 import pytz
 import torch
+import json
+import pathlib
+import plotly.graph_objects as go
 from datetime import datetime, timedelta, timezone
 from transformers import AutoTokenizer, AutoModelForSequenceClassification
 from streamlit_autorefresh import st_autorefresh
 
 st.set_page_config(page_title="Shantanu's Market Update", page_icon="📈", layout="wide")
 
-IST        = pytz.timezone("Asia/Kolkata")
-MODEL_NAME = "ProsusAI/finbert"
+IST            = pytz.timezone("Asia/Kolkata")
+MODEL_NAME     = "ProsusAI/finbert"
+NEWS_BIAS_PATH = pathlib.Path("/tmp/news_bias.json")  # Feature 6 bridge file
 
 NEWSAPI_KEY    = st.secrets.get("NEWSAPI_KEY", "")
 FINNHUB_KEY    = st.secrets.get("FINNHUB_KEY", "")
 FREENEWS_KEY   = st.secrets.get("FREENEWS_KEY", "")
 OWNER_PASSWORD = st.secrets.get("OWNER_PASSWORD", "")
+
+# Upstash Redis — used for cross-session persistence of score_history and
+# news_bias.  Free tier (10k req/day, 256 MB) is sufficient.
+# Add to .streamlit/secrets.toml:
+#   UPSTASH_REDIS_URL   = "https://xxxx.upstash.io"
+#   UPSTASH_REDIS_TOKEN = "your-token"
+REDIS_URL   = st.secrets.get("UPSTASH_REDIS_URL", "")
+REDIS_TOKEN = st.secrets.get("UPSTASH_REDIS_TOKEN", "")
 
 # ── Model (loaded once, shared across all sessions) ───────────────────────────
 
@@ -31,39 +43,136 @@ tokenizer, model = load_model()
 SCORE_MAP = {"positive": 1.0, "neutral": 0.0, "negative": -1.0}
 ID2LABEL  = {0: "negative", 1: "neutral", 2: "positive"}
 
+# ── Feature 5: sector keyword map ────────────────────────────────────────────
+
+SECTOR_KEYWORDS = {
+    "Banking":  ["hdfc", "sbi", "kotak", "axis bank", "icici", "rbi", "npa",
+                 "credit", "bank", "nbfc", "microfinance", "loan", "rate cut", "repo"],
+    "IT":       ["infosys", "tcs", "wipro", "hcl", "tech mahindra", "it sector",
+                 "software", "nasdaq", "tech", "digital", "cloud"],
+    "Energy":   ["reliance", "ongc", "oil", "petroleum", "gas", "crude",
+                 "bpcl", "iocl", "coal india", "ntpc", "power", "solar"],
+    "Pharma":   ["sun pharma", "cipla", "drreddy", "dr. reddy", "fda", "api",
+                 "drug", "biocon", "pharmaceutical", "healthcare", "vaccine"],
+    "Auto":     ["maruti", "tata motors", "m&m", "bajaj auto", "ev",
+                 "automobile", "hero motocorp", "tvs", "electric vehicle"],
+    "FMCG":     ["hul", "dabur", "nestle", "itc", "fmcg", "britannia",
+                 "godrej", "consumer", "marico", "colgate"],
+    "Metals":   ["tata steel", "jsw", "steel", "aluminium", "copper",
+                 "hindalco", "vedanta", "mining", "iron ore", "zinc"],
+    "Infra":    ["l&t", "adani", "infrastructure", "cement", "construction",
+                 "ambuja", "ultratech", "capex", "order win"],
+    "Finance":  ["sebi", "ipo", "fii", "dii", "mutual fund", "amc",
+                 "futures", "options", "derivative"],
+    "NIFTY":    ["nifty", "sensex", "index", "market rally",
+                 "market fall", "bull run", "bear market", "circuit breaker"],
+}
+
 # ── Time helpers ──────────────────────────────────────────────────────────────
 
 def now_ist():
     return datetime.now(IST)
 
 def fmt_ist(dt=None):
-    dt = dt or now_ist()
-    return dt.strftime("%d %b %Y, %I:%M %p IST")
+    return (dt or now_ist()).strftime("%d %b %Y, %I:%M %p IST")
+
+def is_market_hours() -> bool:
+    n = now_ist()
+    if n.weekday() >= 5:
+        return False
+    mins = n.hour * 60 + n.minute
+    return 9 * 60 + 15 <= mins <= 15 * 60 + 30
+
+def session_label() -> str:
+    n = now_ist()
+    if n.weekday() >= 5:        return "Weekend"
+    mins = n.hour * 60 + n.minute
+    if mins < 9 * 60:           return "Pre-Open"
+    if mins < 9 * 60 + 15:     return "Pre-Market"
+    if mins <= 15 * 60 + 30:   return "🟢 Market Open"
+    if mins <= 16 * 60:        return "Post-Market"
+    return "After Hours"
+
+def market_refresh_interval() -> int:
+    """
+    Feature 2: auto-detect optimal refresh cadence by session phase.
+    First/last 30 min → 2 min (high volatility windows).
+    Mid-session       → 5 min.
+    Outside hours     → 20 min.  Weekends → 30 min.
+    """
+    n = now_ist()
+    if n.weekday() >= 5:
+        return 30
+    mins    = n.hour * 60 + n.minute
+    open_m  = 9 * 60 + 15
+    close_m = 15 * 60 + 30
+    if not (open_m <= mins <= close_m):
+        return 20
+    if (mins - open_m) < 30 or (close_m - mins) < 30:
+        return 2
+    return 5
+
+# ── Redis helpers ─────────────────────────────────────────────────────────────
+
+def _redis_hdrs() -> dict:
+    return {"Authorization": f"Bearer {REDIS_TOKEN}"}
+
+def load_history_from_redis() -> list:
+    """
+    Pull score_history from Upstash on cold load so the timeline chart is
+    never blank after a restart, sleep-wake cycle, or new tab.
+    Returns a list of (IST-aware datetime, float, str) tuples, or [] on any error.
+    """
+    if not (REDIS_URL and REDIS_TOKEN):
+        return []
+    try:
+        r = requests.get(
+            f"{REDIS_URL}/get/news_sentiment_history",
+            headers=_redis_hdrs(), timeout=5,
+        )
+        raw = r.json().get("result")
+        if not raw:
+            return []
+        rows = json.loads(raw)           # [[iso_str, score, label], ...]
+        result = []
+        for iso, score, label in rows:
+            dt = datetime.fromisoformat(iso)
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            result.append((dt.astimezone(IST), float(score), str(label)))
+        return result
+    except Exception:
+        return []
+
+def save_history_to_redis(history: list):
+    """
+    Persist the last 12 h of score_history to Upstash.
+    Key expires after 13 h so overnight stale data is cleaned up automatically.
+    """
+    if not (REDIS_URL and REDIS_TOKEN) or not history:
+        return
+    rows = [[t.isoformat(), s, l] for t, s, l in history]
+    try:
+        # Upstash REST: SETEX <key> <seconds> <value>
+        requests.post(
+            f"{REDIS_URL}/setex/news_sentiment_history/46800/"
+            + requests.utils.quote(json.dumps(rows), safe=""),
+            headers=_redis_hdrs(), timeout=5,
+        )
+    except Exception:
+        pass
+
+# ── Date parsing ──────────────────────────────────────────────────────────────
 
 def parse_pub_dt(s: str):
-    """
-    Robustly convert a publication-date string to an IST-aware datetime.
-
-    Bugs fixed vs original:
-    • Removed the s[:25] slice that truncated RFC-2822 dates like
-      "Thu, 11 Jun 2026 07:30:00 +0530" (31 chars) to an unparseable stub.
-    • Normalised "GMT" → "+0000" because strptime does not recognise "GMT"
-      as a timezone name.
-    • Added dateutil fallback that handles virtually every real-world format.
-    """
     if not s:
         return None
-    s = s.strip()
-    # strptime cannot handle the literal string "GMT" as a %z value
-    s_norm = s.replace(" GMT", " +0000")
-
+    s      = s.strip()
+    s_norm = s.replace(" GMT", " +0000")   # strptime doesn't parse "GMT"
     formats = [
-        "%Y-%m-%dT%H:%M:%SZ",
-        "%Y-%m-%dT%H:%M:%S%z",
-        "%Y-%m-%dT%H:%M:%S.%f%z",
-        "%Y-%m-%dT%H:%M:%S.%fZ",
-        "%Y-%m-%dT%H:%M:%S",
-        "%a, %d %b %Y %H:%M:%S %z",
+        "%Y-%m-%dT%H:%M:%SZ",   "%Y-%m-%dT%H:%M:%S%z",
+        "%Y-%m-%dT%H:%M:%S.%f%z", "%Y-%m-%dT%H:%M:%S.%fZ",
+        "%Y-%m-%dT%H:%M:%S",   "%a, %d %b %Y %H:%M:%S %z",
     ]
     for src in (s_norm, s):
         for fmt in formats:
@@ -74,8 +183,6 @@ def parse_pub_dt(s: str):
                 return dt.astimezone(IST)
             except (ValueError, TypeError):
                 pass
-
-    # Last resort: python-dateutil handles almost any format
     try:
         from dateutil import parser as dp
         dt = dp.parse(s)
@@ -89,7 +196,16 @@ def within_last_24h(article: dict) -> bool:
     dt = parse_pub_dt(article.get("published", ""))
     return dt is not None and dt >= now_ist() - timedelta(hours=24)
 
-# ── Data sources ──────────────────────────────────────────────────────────────
+# ── Feature 5: sector tagger ──────────────────────────────────────────────────
+
+def tag_sector(title: str) -> str:
+    t = title.lower()
+    for sector, kws in SECTOR_KEYWORDS.items():
+        if any(kw in t for kw in kws):
+            return sector
+    return "General"
+
+# ── Data fetching ─────────────────────────────────────────────────────────────
 
 @st.cache_data(ttl=300, show_spinner=False)
 def fetch_newsapi():
@@ -98,26 +214,17 @@ def fetch_newsapi():
     try:
         r = requests.get(
             "https://newsapi.org/v2/top-headlines",
-            params={
-                "country": "in",
-                "category": "business",
-                "pageSize": 50,          # was 15 — too few for 24 h
-                "apiKey": NEWSAPI_KEY,
-            },
+            params={"country": "in", "category": "business",
+                    "pageSize": 50, "apiKey": NEWSAPI_KEY},
             timeout=15,
         )
         r.raise_for_status()
         return [
-            {
-                "title":     a.get("title", ""),
-                "source":    a.get("source", {}).get("name", "NewsAPI"),
-                "url":       a.get("url", ""),
-                "published": a.get("publishedAt", ""),
-                "feed":      "NewsAPI",
-            }
+            {"title": a.get("title", ""),
+             "source": a.get("source", {}).get("name", "NewsAPI"),
+             "url": a.get("url", ""), "published": a.get("publishedAt", ""),
+             "feed": "NewsAPI"}
             for a in r.json().get("articles", [])
-            # Free-tier NewsAPI returns placeholder "[Removed]" titles for
-            # paywalled articles — filter them out
             if a.get("title") and "[Removed]" not in a.get("title", "")
         ]
     except Exception:
@@ -134,46 +241,44 @@ def fetch_finnhub():
             timeout=15,
         )
         r.raise_for_status()
-        # Bug fixed: r.json() was called twice (two JSON deserialisations)
         data  = r.json()
         items = data if isinstance(data, list) else []
-        out   = []
-        for a in items[:40]:                 # was 15
-            if a.get("headline"):
-                out.append({
-                    "title":     a["headline"],
-                    "source":    a.get("source", "Finnhub"),
-                    "url":       a.get("url", ""),
-                    # Use UTC explicitly; IST is a DST-aware zone and .isoformat()
-                    # from pytz-localised datetimes is fine, but UTC is cleaner here
-                    "published": datetime.fromtimestamp(
-                        a["datetime"], tz=timezone.utc
-                    ).isoformat(),
-                    "feed":      "Finnhub",
-                })
-        return out
+        return [
+            {"title": a["headline"],
+             "source": a.get("source", "Finnhub"),
+             "url": a.get("url", ""),
+             "published": datetime.fromtimestamp(a["datetime"], tz=timezone.utc).isoformat(),
+             "feed": "Finnhub"}
+            for a in items[:40]
+            if a.get("headline")
+        ]
     except Exception:
         return []
 
 @st.cache_data(ttl=300, show_spinner=False)
 def fetch_rss():
     feeds = [
-        ("RBI",           "https://www.rbi.org.in/RSS/RBIRSSFeed.aspx?Id=316"),
-        ("PIB",           "https://pib.gov.in/RSSNewsFeed.aspx?ModID=6"),
-        ("ET Markets",    "https://economictimes.indiatimes.com/markets/rssfeeds/1977021501.cms"),
-        ("Moneycontrol",  "https://www.moneycontrol.com/rss/marketreports.xml"),
-        ("LiveMint",      "https://www.livemint.com/rss/markets"),
-        # Added for better 24-h Indian market coverage
-        ("Business Std",  "https://www.business-standard.com/rss/markets-106.rss"),
-        ("Hindu BizLine", "https://www.thehindubusinessline.com/markets/feeder/default.rss"),
-        ("Financial Exp", "https://www.financialexpress.com/market/feed/"),
-        ("NDTV Profit",   "https://feeds.feedburner.com/ndtvprofit-latest"),
+        # General Indian business / market feeds
+        ("RBI",              "https://www.rbi.org.in/RSS/RBIRSSFeed.aspx?Id=316"),
+        ("PIB",              "https://pib.gov.in/RSSNewsFeed.aspx?ModID=6"),
+        ("ET Markets",       "https://economictimes.indiatimes.com/markets/rssfeeds/1977021501.cms"),
+        ("Moneycontrol",     "https://www.moneycontrol.com/rss/marketreports.xml"),
+        ("LiveMint",         "https://www.livemint.com/rss/markets"),
+        ("Business Std",     "https://www.business-standard.com/rss/markets-106.rss"),
+        ("Hindu BizLine",    "https://www.thehindubusinessline.com/markets/feeder/default.rss"),
+        ("Financial Exp",    "https://www.financialexpress.com/market/feed/"),
+        ("NDTV Profit",      "https://feeds.feedburner.com/ndtvprofit-latest"),
+        # ── Feature 1: NSE/BSE exchange filings — highest-signal source ──────
+        # Board meeting/result date announcements move stocks immediately.
+        ("NSE Board Mtgs",   "https://nsearchives.nseindia.com/content/RSS/boardMeetings.xml"),
+        ("NSE Qtly Results", "https://nsearchives.nseindia.com/content/RSS/quarterlyResults.xml"),
+        ("BSE Corp Actions", "https://www.bseindia.com/Rss/RssXml.aspx?Type=31"),
     ]
     results = []
     for name, url in feeds:
         try:
             feed = feedparser.parse(url)
-            for e in feed.entries[:12]:     # was 5 — too few for 24 h
+            for e in feed.entries[:12]:
                 title = getattr(e, "title", "").strip()
                 if title:
                     results.append({
@@ -195,24 +300,17 @@ def fetch_freenews():
     try:
         r = requests.get(
             "https://freenewsapi.io/api/v1/news",
-            params={
-                "country":  "IN",
-                "language": "en",
-                "category": "business",
-                "pageSize": 20,
-                "apiKey":   FREENEWS_KEY,
-            },
+            params={"country": "IN", "language": "en",
+                    "category": "business", "pageSize": 20,
+                    "apiKey": FREENEWS_KEY},
             timeout=15,
         )
         r.raise_for_status()
         return [
-            {
-                "title":     a.get("title", ""),
-                "source":    a.get("source", {}).get("name", "FreeNews"),
-                "url":       a.get("url", ""),
-                "published": a.get("publishedAt", ""),
-                "feed":      "FreeNewsAPI",
-            }
+            {"title": a.get("title", ""),
+             "source": a.get("source", {}).get("name", "FreeNews"),
+             "url": a.get("url", ""), "published": a.get("publishedAt", ""),
+             "feed": "FreeNewsAPI"}
             for a in r.json().get("articles", [])
             if a.get("title")
         ]
@@ -235,52 +333,115 @@ def load_all() -> list:
     raw = dedupe(raw)
     raw = [a for a in raw if within_last_24h(a)]
     raw.sort(
-        # Bug fixed: datetime.min.replace(tzinfo=IST) is wrong — pytz zones must
-        # never be attached via .replace(); use a plain UTC sentinel instead.
         key=lambda x: parse_pub_dt(x.get("published", ""))
                       or datetime.min.replace(tzinfo=timezone.utc),
         reverse=True,
     )
-    return raw[:150]                         # was 60
+    return raw[:150]
 
 def score_articles(articles: list) -> list:
     scored = []
     with torch.no_grad():
         for a in articles:
             inputs = tokenizer(
-                a["title"][:512],
-                return_tensors="pt",
-                truncation=True,
-                max_length=512,
+                a["title"][:512], return_tensors="pt",
+                truncation=True, max_length=512,
             )
             logits = model(**inputs).logits[0]
             probs  = torch.softmax(logits, dim=-1)
             idx    = int(torch.argmax(probs).item())
             label  = ID2LABEL[idx]
             conf   = float(probs[idx].item())
-            # Bug fixed: original code mutated dicts that came from @st.cache_data
-            # functions, causing aliasing bugs on subsequent cached reads.
-            # Now we always create a new dict.
             scored.append({
                 **a,
                 "sentiment":  label,
                 "confidence": round(conf, 3),
                 "score":      SCORE_MAP[label],
+                "sector":     tag_sector(a["title"]),  # Feature 5
             })
     return scored
 
 @st.cache_data(ttl=300, show_spinner=False)
 def get_fresh_data():
-    """
-    Full pipeline: fetch → dedupe → 24-h filter → FinBERT score.
-    Result cached for 5 min so FinBERT inference only runs on cache-miss,
-    not on every Streamlit rerun.
-    """
+    """Full fetch → dedupe → 24-h filter → FinBERT score pipeline.
+    @st.cache_data(ttl=300) ensures FinBERT inference runs at most once per
+    5-minute window — not on every Streamlit rerun."""
     arts    = score_articles(load_all())
     scores  = [a["score"] for a in arts]
     avg     = round(sum(scores) / len(scores), 3) if scores else 0.0
     overall = "Bullish" if avg > 0.15 else ("Bearish" if avg < -0.15 else "Neutral")
     return arts, avg, overall
+
+# ── Feature 6: news-bias bridge ───────────────────────────────────────────────
+
+def write_news_bias(arts: list, avg: float, overall: str) -> dict:
+    """
+    Persists the current market-sentiment snapshot in two places:
+
+    1. /tmp/news_bias.json  — works for co-located processes (local / same container).
+    2. Upstash Redis key "news_bias" (TTL 10 min) — survives container recycles and
+       works across Streamlit Cloud, so the options dashboard always finds fresh data.
+
+    ── Reading from Redis in your options dashboard ─────────────────────────────
+        import requests, json, os
+        def get_news_bias() -> dict:
+            url   = os.environ["UPSTASH_REDIS_URL"]
+            token = os.environ["UPSTASH_REDIS_TOKEN"]
+            try:
+                r = requests.get(f"{url}/get/news_bias",
+                                 headers={"Authorization": f"Bearer {token}"},
+                                 timeout=3)
+                raw = r.json().get("result")
+                return json.loads(raw) if raw else {}
+            except Exception:
+                return {}
+
+        bias = get_news_bias()
+        news_score  = bias.get("avg_score", 0.0)      # float -1.0 … +1.0
+        news_label  = bias.get("overall", "Neutral")  # Bullish/Neutral/Bearish
+        sector_map  = bias.get("sector_sentiment", {}) # {sector: score}
+        bull_pct    = bias.get("bull_pct", 0.0)
+        bear_pct    = bias.get("bear_pct", 0.0)
+    ─────────────────────────────────────────────────────────────────────────────
+    """
+    n      = len(arts)
+    bull_n = sum(1 for a in arts if a["sentiment"] == "positive")
+    bear_n = sum(1 for a in arts if a["sentiment"] == "negative")
+
+    smap: dict = {}
+    for a in arts:
+        smap.setdefault(a.get("sector", "General"), []).append(a["score"])
+    sector_sentiment = {s: round(sum(v) / len(v), 3) for s, v in smap.items() if v}
+
+    payload = {
+        "avg_score":        avg,
+        "overall":          overall,
+        "bull_pct":         round(bull_n / n * 100, 1) if n else 0.0,
+        "bear_pct":         round(bear_n / n * 100, 1) if n else 0.0,
+        "article_count":    n,
+        "sector_sentiment": sector_sentiment,
+        "market_session":   session_label(),
+        "updated_ist":      fmt_ist(),
+    }
+
+    # ── 1. Local file (co-located processes) ──────────────────────────────────
+    try:
+        NEWS_BIAS_PATH.write_text(json.dumps(payload, indent=2))
+    except Exception:
+        pass
+
+    # ── 2. Upstash Redis (cross-container / Streamlit Cloud) ──────────────────
+    if REDIS_URL and REDIS_TOKEN:
+        try:
+            requests.post(
+                f"{REDIS_URL}/setex/news_bias/600/"
+                + requests.utils.quote(json.dumps(payload), safe=""),
+                headers=_redis_hdrs(), timeout=5,
+            )
+        except Exception:
+            pass
+
+    return payload
 
 # ── Session-state bootstrap ───────────────────────────────────────────────────
 
@@ -293,8 +454,11 @@ _defaults = {
     "overall":            "Neutral",
     "change":             "—",
     "last_updated":       fmt_ist(),
-    "refresh_minutes":    10,
-    "last_refresh_count": -1,   # tracks st_autorefresh counter to detect real ticks
+    "last_refresh_count": -1,
+    "score_history":      load_history_from_redis(),  # seeded from Redis on cold load
+    "bias_payload":       {},     # Feature 6: last written JSON payload
+    "auto_refresh_chk":   True,   # Feature 2: auto-mode on by default
+    "manual_interval":    5,      # Feature 2: manual override value (minutes)
 }
 for _k, _v in _defaults.items():
     if _k not in st.session_state:
@@ -310,44 +474,62 @@ with st.sidebar:
 
     if st.session_state.owner_ok:
         st.success("Owner mode enabled")
-        st.session_state.refresh_minutes = st.selectbox(
-            "Auto-refresh frequency (minutes)",
-            [5, 10, 15, 30, 60],
-            index=[5, 10, 15, 30, 60].index(st.session_state.refresh_minutes),
-        )
+
+        # Feature 2: auto vs manual refresh controls
+        st.markdown("**Refresh Interval**")
+        st.checkbox("Auto (market-hours aware)", key="auto_refresh_chk")
+        if not st.session_state.auto_refresh_chk:
+            _opts = [2, 5, 10, 15, 30, 60]
+            _cur  = st.session_state.manual_interval
+            st.session_state.manual_interval = st.selectbox(
+                "Manual frequency (minutes)", _opts,
+                index=_opts.index(_cur) if _cur in _opts else 1,
+            )
+        else:
+            st.caption(
+                f"Auto-detected: **{market_refresh_interval()} min** · {session_label()}"
+            )
+
         if st.button("SOS Manual Refresh"):
+            # Clearing cache + resetting counter causes needs_load=True on rerun.
+            # get_fresh_data() re-runs fresh; no double-scoring since cache was cleared.
             st.cache_data.clear()
-            arts, avg, overall = get_fresh_data()
-            delta = round(avg - st.session_state.prev_score, 3)
-            if st.session_state.prev_sentiment and overall != st.session_state.prev_sentiment:
-                change = f"{st.session_state.prev_sentiment} → {overall} ({delta:+.3f})"
-            else:
-                change = f"{delta:+.3f}"
-            st.session_state.articles           = arts
-            st.session_state.avg_score          = avg
-            st.session_state.overall            = overall
-            st.session_state.change             = change
-            st.session_state.prev_score         = avg
-            st.session_state.prev_sentiment     = overall
-            st.session_state.last_updated       = fmt_ist()
-            st.session_state.last_refresh_count = -1   # reset so next tick is fresh
+            st.session_state.last_refresh_count = -1
             st.rerun()
+
+        # Feature 6: live bridge payload viewer
+        if st.session_state.bias_payload:
+            with st.expander("📡 Dashboard Bridge Payload", expanded=False):
+                st.code(
+                    json.dumps(st.session_state.bias_payload, indent=2),
+                    language="json",
+                )
+                st.caption(f"Written to `{NEWS_BIAS_PATH}`")
     else:
         st.info("Read-only mode")
 
+# ── Feature 2: resolve effective refresh interval (after sidebar widget state) ──
+
+auto_interval = market_refresh_interval()
+eff_interval  = (
+    auto_interval
+    if st.session_state.auto_refresh_chk
+    else st.session_state.manual_interval
+)
+
 # ── Auto-refresh ──────────────────────────────────────────────────────────────
-# Bug fixed: original code ignored the return value of st_autorefresh, so a
-# timed rerun re-rendered stale session-state data instead of fetching fresh
-# articles.  We now compare the counter to detect a real tick.
+# refresh_count increments on every timer tick; comparing to last stored value
+# is the only reliable way to detect that a real tick (not a user interaction
+# rerun) has fired.
 
 refresh_count = st_autorefresh(
-    interval=st.session_state.refresh_minutes * 60 * 1000,
+    interval=eff_interval * 60 * 1000,
     key="refresh_timer",
 )
 
 needs_load = (
-    not st.session_state.articles                               # initial page load
-    or refresh_count != st.session_state.last_refresh_count    # auto-refresh tick
+    not st.session_state.articles                               # initial load
+    or refresh_count != st.session_state.last_refresh_count    # timer tick
 )
 
 if needs_load:
@@ -364,6 +546,14 @@ if needs_load:
     else:
         change = f"{delta:+.3f}"
 
+    # Feature 3: append to rolling timeline; keep last 12 hours only
+    st.session_state.score_history.append((now_ist(), avg, overall))
+    _cutoff = now_ist() - timedelta(hours=12)
+    st.session_state.score_history = [
+        row for row in st.session_state.score_history
+        if row[0] >= _cutoff
+    ]
+
     st.session_state.articles           = arts
     st.session_state.avg_score          = avg
     st.session_state.overall            = overall
@@ -373,6 +563,12 @@ if needs_load:
     st.session_state.last_updated       = fmt_ist()
     st.session_state.last_refresh_count = refresh_count
 
+    # Feature 6: write bridge JSON + mirror to Redis after every data refresh
+    st.session_state.bias_payload = write_news_bias(arts, avg, overall)
+
+    # Persist rolling history to Redis so cold loads start with data
+    save_history_to_redis(st.session_state.score_history)
+
 # ── CSS ───────────────────────────────────────────────────────────────────────
 
 st.markdown("""
@@ -380,75 +576,244 @@ st.markdown("""
   .stApp { background: white; color: #111; }
   [data-testid="stSidebar"] { background: #fafafa; border-right: 1px solid #e5e7eb; }
   .card {
-    background: white;
-    border: 1px solid #e5e7eb;
-    border-left-width: 5px;
-    border-radius: 12px;
-    padding: 14px 16px;
-    margin-bottom: 10px;
+    background: white; border: 1px solid #e5e7eb;
+    border-left-width: 5px; border-radius: 12px;
+    padding: 14px 16px; margin-bottom: 10px;
   }
-  .bull { border-left-color: #22c55e; }
-  .bear { border-left-color: #ef4444; }
-  .neut { border-left-color: #f59e0b; }
+  .bull  { border-left-color: #22c55e; }
+  .bear  { border-left-color: #ef4444; }
+  .neut  { border-left-color: #f59e0b; }
+  .hot-panel {
+    background: #fff7ed; border: 2px solid #f97316;
+    border-radius: 12px; padding: 12px 16px; margin-bottom: 14px;
+  }
   .badge {
-    display: inline-block;
-    padding: 2px 8px;
-    border-radius: 999px;
-    font-size: 12px;
-    font-weight: 700;
+    display: inline-block; padding: 2px 8px;
+    border-radius: 999px; font-size: 12px; font-weight: 700;
   }
-  .badge-bull { background: #ecfdf5; color: #15803d; }
-  .badge-bear { background: #fef2f2; color: #b91c1c; }
-  .badge-neut { background: #fffbeb; color: #b45309; }
+  .badge-bull   { background: #ecfdf5; color: #15803d; }
+  .badge-bear   { background: #fef2f2; color: #b91c1c; }
+  .badge-neut   { background: #fffbeb; color: #b45309; }
+  .badge-sector { background: #f0f9ff; color: #0369a1; }
 </style>
 """, unsafe_allow_html=True)
 
-# ── Main UI ───────────────────────────────────────────────────────────────────
+# ── Local convenience refs ────────────────────────────────────────────────────
 
 articles = st.session_state.articles
 avg      = st.session_state.avg_score
 overall  = st.session_state.overall
+bull     = [a for a in articles if a["sentiment"] == "positive"]
+bear     = [a for a in articles if a["sentiment"] == "negative"]
+neut     = [a for a in articles if a["sentiment"] == "neutral"]
 
-bull = [a for a in articles if a["sentiment"] == "positive"]
-bear = [a for a in articles if a["sentiment"] == "negative"]
-neut = [a for a in articles if a["sentiment"] == "neutral"]
+# ── Header & metrics ──────────────────────────────────────────────────────────
 
 st.markdown("### Shantanu's Market Update")
-st.markdown(f"**LAST UPDATED AT:** {st.session_state.last_updated}")
-st.caption("All timestamps shown in IST · Showing last 24 hours of news")
 
-c1, c2, c3 = st.columns(3)
-c1.metric("Overall", overall)
-c2.metric("Score",   f"{avg:+.3f}")
-c3.metric("Change",  st.session_state.change)
+col_t, col_s = st.columns([7, 1])
+with col_t:
+    st.markdown(f"**LAST UPDATED AT:** {st.session_state.last_updated}")
+    st.caption(
+        f"Last 24 h · Auto-refresh every **{eff_interval} min** · {session_label()}"
+    )
+with col_s:
+    mkt_clr = "#22c55e" if is_market_hours() else "#6b7280"
+    st.markdown(
+        f"<div style='text-align:right;margin-top:6px;'>"
+        f"<span style='color:{mkt_clr};font-weight:700;font-size:13px;'>"
+        f"{session_label()}</span></div>",
+        unsafe_allow_html=True,
+    )
 
-st.write("### Latest Headlines")
+c1, c2, c3, c4 = st.columns(4)
+c1.metric("Overall",  overall)
+c2.metric("Score",    f"{avg:+.3f}")
+c3.metric("Change",   st.session_state.change)
+c4.metric("Articles", len(articles))
+
+# ── Feature 4: High-conviction alert panel ────────────────────────────────────
+# Shows only articles where FinBERT confidence > 82% AND published in the last
+# 20 minutes — the "stop-what-you're-doing" items during market hours.
+
+_hot_cutoff = now_ist() - timedelta(minutes=20)
+hot_news    = [
+    a for a in articles
+    if a["confidence"] > 0.82
+    and (parse_pub_dt(a.get("published", ""))
+         or datetime.min.replace(tzinfo=timezone.utc)) >= _hot_cutoff
+]
+
+if hot_news:
+    st.markdown(
+        f"<div class='hot-panel'>"
+        f"<b>🚨 HIGH-CONVICTION ALERTS</b>&nbsp;&nbsp;"
+        f"<span style='font-size:13px;color:#92400e'>"
+        f"{len(hot_news)} item(s) · published last 20 min · FinBERT conf &gt; 82%"
+        f"</span></div>",
+        unsafe_allow_html=True,
+    )
+    for a in hot_news:
+        cls    = ("bull" if a["sentiment"] == "positive"
+                  else "bear" if a["sentiment"] == "negative" else "neut")
+        icon   = "▲" if cls == "bull" else "▼" if cls == "bear" else "●"
+        ts     = parse_pub_dt(a.get("published", ""))
+        ts_txt = ts.strftime("%I:%M %p IST") if ts else "—"
+        st.markdown(
+            f"""<div class="card {cls}" style="margin-bottom:6px;">
+              <a href="{a['url']}" target="_blank"><b>{a['title']}</b></a><br>
+              <span class="badge badge-{cls}">{icon} {a['sentiment']}</span>
+              <span class="badge badge-sector" style="margin-left:6px;">
+                {a.get('sector','General')}
+              </span>
+              <span style="margin-left:8px;color:#6b7280">
+                {a['source']} · {ts_txt} · conf {int(a['confidence']*100)}%
+              </span>
+            </div>""",
+            unsafe_allow_html=True,
+        )
+
+# ── Features 3 & 5: Analytics charts row ─────────────────────────────────────
+
+ch_l, ch_r = st.columns(2)
+
+# ── Feature 3: Rolling intraday sentiment timeline ────────────────────────────
+
+with ch_l:
+    history = st.session_state.score_history
+    if len(history) >= 2:
+        _times  = [t for t, _, _ in history]
+        _scores = [s for _, s, _ in history]
+        _labels = [l for _, _, l in history]
+        _clr    = ["#22c55e" if s > 0.15 else "#ef4444" if s < -0.15 else "#f59e0b"
+                   for s in _scores]
+
+        fig_tl = go.Figure()
+        # Coloured background bands for bullish/bearish zones
+        fig_tl.add_hrect(y0=0.15,  y1=1.0,  fillcolor="#dcfce7", opacity=0.18, line_width=0)
+        fig_tl.add_hrect(y0=-1.0,  y1=-0.15, fillcolor="#fee2e2", opacity=0.18, line_width=0)
+        # Threshold reference lines
+        fig_tl.add_hline(y=0,      line_dash="dot", line_color="#9ca3af", line_width=1)
+        fig_tl.add_hline(y=0.15,   line_dash="dot", line_color="#22c55e", line_width=0.8)
+        fig_tl.add_hline(y=-0.15,  line_dash="dot", line_color="#ef4444", line_width=0.8)
+        fig_tl.add_trace(go.Scatter(
+            x=_times, y=_scores,
+            mode="lines+markers",
+            line=dict(color="#6366f1", width=2.5),
+            marker=dict(color=_clr, size=9,
+                        line=dict(color="white", width=1.5)),
+            text=_labels,
+            hovertemplate="%{x|%H:%M IST}<br>Score: %{y:.3f} · %{text}<extra></extra>",
+        ))
+        fig_tl.update_layout(
+            height=240,
+            margin=dict(l=0, r=10, t=32, b=0),
+            plot_bgcolor="white", paper_bgcolor="white",
+            title=dict(text="Intraday Sentiment Score  (12 h rolling)",
+                       font=dict(size=13, color="#374151")),
+            xaxis=dict(showgrid=False, title=""),
+            yaxis=dict(showgrid=True, gridcolor="#f3f4f6",
+                       range=[-1.05, 1.05], title="Score"),
+        )
+        st.plotly_chart(fig_tl, use_container_width=True)
+    else:
+        st.info("Sentiment timeline builds after 2+ refreshes.")
+
+# ── Feature 5: Sector sentiment bar chart ────────────────────────────────────
+
+with ch_r:
+    _smap: dict = {}
+    for a in articles:
+        _sec = a.get("sector", "General")
+        _smap.setdefault(_sec, {"scores": [], "count": 0})
+        _smap[_sec]["scores"].append(a["score"])
+        _smap[_sec]["count"] += 1
+
+    if _smap:
+        _sects = sorted(
+            _smap.keys(),
+            key=lambda x: sum(_smap[x]["scores"]) / len(_smap[x]["scores"]),
+            reverse=True,
+        )
+        _avgs  = [round(sum(_smap[s]["scores"]) / len(_smap[s]["scores"]), 3)
+                  for s in _sects]
+        _cnts  = [_smap[s]["count"] for s in _sects]
+        _bclr  = ["#22c55e" if v > 0.15 else "#ef4444" if v < -0.15 else "#f59e0b"
+                  for v in _avgs]
+
+        fig_sc = go.Figure(go.Bar(
+            x=_sects, y=_avgs,
+            marker_color=_bclr,
+            text=[f"{v:+.2f} ({c})" for v, c in zip(_avgs, _cnts)],
+            textposition="outside",
+            hovertemplate="%{x}<br>Avg Score: %{y:.3f}<extra></extra>",
+        ))
+        fig_sc.add_hline(y=0, line_dash="dot", line_color="#9ca3af", line_width=1)
+        fig_sc.update_layout(
+            height=240,
+            margin=dict(l=0, r=10, t=32, b=0),
+            plot_bgcolor="white", paper_bgcolor="white",
+            title=dict(text="Sector Sentiment Breakdown",
+                       font=dict(size=13, color="#374151")),
+            xaxis=dict(showgrid=False, tickangle=-25),
+            yaxis=dict(showgrid=True, gridcolor="#f3f4f6",
+                       range=[-1.2, 1.4], title="Score"),
+        )
+        st.plotly_chart(fig_sc, use_container_width=True)
+
+# ── Headlines with sector filter ──────────────────────────────────────────────
+
+col_h, col_f = st.columns([5, 2])
+with col_h:
+    st.write("### Latest Headlines")
+with col_f:
+    _sectors_present = sorted(set(a.get("sector", "General") for a in articles))
+    sel_sector = st.selectbox(
+        "Sector filter",
+        ["All Sectors"] + _sectors_present,
+        key="sector_filter",
+        label_visibility="collapsed",
+    )
+
+filtered = (
+    articles if sel_sector == "All Sectors"
+    else [a for a in articles if a.get("sector") == sel_sector]
+)
+f_bull = [a for a in filtered if a["sentiment"] == "positive"]
+f_bear = [a for a in filtered if a["sentiment"] == "negative"]
+f_neut = [a for a in filtered if a["sentiment"] == "neutral"]
 
 tabs = st.tabs([
-    f"All ({len(articles)})",
-    f"Bullish ({len(bull)})",
-    f"Neutral ({len(neut)})",
-    f"Bearish ({len(bear)})",
+    f"All ({len(filtered)})",
+    f"Bullish ({len(f_bull)})",
+    f"Neutral ({len(f_neut)})",
+    f"Bearish ({len(f_bear)})",
 ])
 
-def render(items):
+def render(items: list):
+    if not items:
+        st.caption("No articles in this view.")
+        return
     for a in items:
-        cls   = "bull" if a["sentiment"] == "positive" else ("bear" if a["sentiment"] == "negative" else "neut")
-        badge = "badge-bull" if cls == "bull" else ("badge-bear" if cls == "bear" else "badge-neut")
-        icon  = "▲" if cls == "bull" else ("▼" if cls == "bear" else "●")
-        ts    = parse_pub_dt(a.get("published", ""))
+        cls    = ("bull" if a["sentiment"] == "positive"
+                  else "bear" if a["sentiment"] == "negative" else "neut")
+        icon   = "▲" if cls == "bull" else "▼" if cls == "bear" else "●"
+        ts     = parse_pub_dt(a.get("published", ""))
         ts_txt = ts.strftime("%d %b %Y, %I:%M %p IST") if ts else "Time unavailable"
-        st.markdown(f"""
-        <div class="card {cls}">
-          <a href="{a['url']}" target="_blank"><b>{a['title']}</b></a><br>
-          <span class="badge {badge}">{icon} {a['sentiment']}</span>
-          <span style="margin-left:8px;color:#6b7280">
-            {a['source']} · {a['feed']} · {ts_txt} · conf {int(a['confidence'] * 100)}%
-          </span>
-        </div>
-        """, unsafe_allow_html=True)
+        sector = a.get("sector", "General")
+        st.markdown(
+            f"""<div class="card {cls}">
+              <a href="{a['url']}" target="_blank"><b>{a['title']}</b></a><br>
+              <span class="badge badge-{cls}">{icon} {a['sentiment']}</span>
+              <span class="badge badge-sector" style="margin-left:6px;">{sector}</span>
+              <span style="margin-left:8px;color:#6b7280">
+                {a['source']} · {a['feed']} · {ts_txt} · conf {int(a['confidence']*100)}%
+              </span>
+            </div>""",
+            unsafe_allow_html=True,
+        )
 
-with tabs[0]: render(articles)
-with tabs[1]: render(bull)
-with tabs[2]: render(neut)
-with tabs[3]: render(bear)
+with tabs[0]: render(filtered)
+with tabs[1]: render(f_bull)
+with tabs[2]: render(f_neut)
+with tabs[3]: render(f_bear)
