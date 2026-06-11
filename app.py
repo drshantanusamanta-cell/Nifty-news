@@ -277,10 +277,20 @@ def fetch_rss():
         ("BSE Corp Actions", "https://www.bseindia.com/Rss/RssXml.aspx?Type=31"),
     ]
 
+    # Per-feed timeout: fetch via requests (hard 8 s limit) then parse bytes.
+    # feedparser.parse(url) uses urllib with NO timeout — one slow server
+    # (NSE/BSE archives are known offenders) can hang the thread forever.
+    # This was the root cause of the stuck spinner.
+    _HEADERS      = {"User-Agent": "Mozilla/5.0 (compatible; feedparser/6.0)"}
+    _FEED_TIMEOUT = 8    # seconds per individual feed HTTP request
+    _POOL_TIMEOUT = 20   # seconds for ALL feeds combined
+
     def _fetch_one(name_url):
         name, url = name_url
         try:
-            feed = feedparser.parse(url)
+            r    = requests.get(url, timeout=_FEED_TIMEOUT, headers=_HEADERS)
+            r.raise_for_status()
+            feed = feedparser.parse(r.content)   # parse raw bytes, NOT the URL
             items = []
             for e in feed.entries[:12]:
                 title = getattr(e, "title", "").strip()
@@ -295,16 +305,26 @@ def fetch_rss():
                     })
             return items
         except Exception:
-            return []
+            return []   # any timeout or HTTP error: skip silently
 
-    # Fetch all 12 feeds concurrently instead of serially.
-    # Wall-clock time drops from ~(12 × slowest_feed) to ~slowest_feed alone.
-    from concurrent.futures import ThreadPoolExecutor, as_completed
+    from concurrent.futures import ThreadPoolExecutor, as_completed, TimeoutError as FuturesTimeout
     results = []
     with ThreadPoolExecutor(max_workers=12) as pool:
         futures = {pool.submit(_fetch_one, f): f for f in feeds}
-        for fut in as_completed(futures):
-            results.extend(fut.result())
+        try:
+            for fut in as_completed(futures, timeout=_POOL_TIMEOUT):
+                try:
+                    results.extend(fut.result())
+                except Exception:
+                    pass
+        except FuturesTimeout:
+            # Collect whatever finished within the budget; drop the rest.
+            for fut in futures:
+                if fut.done() and not fut.cancelled():
+                    try:
+                        results.extend(fut.result())
+                    except Exception:
+                        pass
     return results
 
 @st.cache_data(ttl=300, show_spinner=False)
@@ -343,7 +363,19 @@ def dedupe(items: list) -> list:
     return out
 
 def load_all() -> list:
-    raw = fetch_newsapi() + fetch_finnhub() + fetch_rss() + fetch_freenews()
+    # Run all four sources concurrently instead of sequentially.
+    # Each is already @st.cache_data so a cache-hit returns instantly;
+    # on a cache-miss all four network calls fire at the same time.
+    from concurrent.futures import ThreadPoolExecutor
+    sources = [fetch_newsapi, fetch_finnhub, fetch_rss, fetch_freenews]
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        futures = [pool.submit(fn) for fn in sources]
+        raw = []
+        for fut in futures:
+            try:
+                raw.extend(fut.result())
+            except Exception:
+                pass
     raw = dedupe(raw)
     raw = [a for a in raw if within_last_24h(a)]
     raw.sort(
