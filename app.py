@@ -1,198 +1,287 @@
 import streamlit as st
-import pytz
+import requests, feedparser, pytz, torch
 from datetime import datetime
+from transformers import AutoTokenizer, AutoModelForSequenceClassification
 from streamlit_autorefresh import st_autorefresh
-from news_fetcher import fetch_all
-from sentiment import score_articles
 
-st.set_page_config(
-    page_title="Nifty Sentiment Monitor",
-    page_icon="📈",
-    layout="wide",
-    initial_sidebar_state="expanded"
-)
+st.set_page_config(page_title="Nifty Sentiment Monitor", page_icon="📈", layout="wide")
 
 IST = pytz.timezone("Asia/Kolkata")
+MODEL_NAME = "ProsusAI/finbert"
 
-# ── Custom CSS ────────────────────────────────────────────────────────────────
+NEWSAPI_KEY = st.secrets.get("NEWSAPI_KEY", "")
+FINNHUB_KEY = st.secrets.get("FINNHUB_KEY", "")
+FREENEWS_KEY = st.secrets.get("FREENEWS_KEY", "")
+OWNER_PASSWORD = st.secrets.get("OWNER_PASSWORD", "")
+
+@st.cache_resource
+def load_model():
+    tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
+    model = AutoModelForSequenceClassification.from_pretrained(MODEL_NAME)
+    model.eval()
+    return tokenizer, model
+
+tokenizer, model = load_model()
+
+SCORE_MAP = {"positive": 1.0, "neutral": 0.0, "negative": -1.0}
+ID2LABEL = {0: "negative", 1: "neutral", 2: "positive"}
+
+@st.cache_data(ttl=600, show_spinner=False)
+def fetch_newsapi():
+    try:
+        r = requests.get(
+            "https://newsapi.org/v2/top-headlines",
+            params={"country": "in", "category": "business", "pageSize": 15, "apiKey": NEWSAPI_KEY},
+            timeout=15,
+        )
+        items = r.json().get("articles", [])
+        return [
+            {
+                "title": a.get("title", ""),
+                "source": a.get("source", {}).get("name", "NewsAPI"),
+                "url": a.get("url", ""),
+                "published": a.get("publishedAt", ""),
+                "feed": "NewsAPI",
+            }
+            for a in items if a.get("title")
+        ]
+    except:
+        return []
+
+@st.cache_data(ttl=600, show_spinner=False)
+def fetch_finnhub():
+    try:
+        r = requests.get(
+            "https://finnhub.io/api/v1/news",
+            params={"category": "general", "token": FINNHUB_KEY},
+            timeout=15,
+        )
+        items = r.json() if isinstance(r.json(), list) else []
+        out = []
+        for a in items[:15]:
+            if a.get("headline"):
+                out.append({
+                    "title": a["headline"],
+                    "source": a.get("source", "Finnhub"),
+                    "url": a.get("url", ""),
+                    "published": datetime.fromtimestamp(a["datetime"], tz=IST).isoformat(),
+                    "feed": "Finnhub",
+                })
+        return out
+    except:
+        return []
+
+@st.cache_data(ttl=600, show_spinner=False)
+def fetch_rss():
+    feeds = [
+        ("RBI", "https://www.rbi.org.in/RSS/RBIRSSFeed.aspx?Id=316"),
+        ("PIB", "https://pib.gov.in/RSSNewsFeed.aspx?ModID=6"),
+        ("ET Markets", "https://economictimes.indiatimes.com/markets/rssfeeds/1977021501.cms"),
+        ("Moneycontrol", "https://www.moneycontrol.com/rss/marketreports.xml"),
+        ("LiveMint", "https://www.livemint.com/rss/markets"),
+    ]
+    results = []
+    for name, url in feeds:
+        try:
+            feed = feedparser.parse(url)
+            for e in feed.entries[:5]:
+                results.append({
+                    "title": getattr(e, "title", ""),
+                    "source": name,
+                    "url": getattr(e, "link", ""),
+                    "published": getattr(e, "published", getattr(e, "updated", "")),
+                    "feed": "RSS",
+                })
+        except:
+            pass
+    return results
+
+@st.cache_data(ttl=600, show_spinner=False)
+def fetch_freenews():
+    try:
+        r = requests.get(
+            "https://freenewsapi.io/api/v1/news",
+            params={"country": "IN", "language": "en", "category": "business", "pageSize": 10, "apiKey": FREENEWS_KEY},
+            timeout=15,
+        )
+        items = r.json().get("articles", [])
+        return [
+            {
+                "title": a.get("title", ""),
+                "source": a.get("source", {}).get("name", "FreeNews"),
+                "url": a.get("url", ""),
+                "published": a.get("publishedAt", ""),
+                "feed": "FreeNewsAPI",
+            }
+            for a in items if a.get("title")
+        ]
+    except:
+        return []
+
+def parse_date(s):
+    for fmt in ("%Y-%m-%dT%H:%M:%SZ", "%Y-%m-%dT%H:%M:%S", "%a, %d %b %Y %H:%M:%S %z", "%a, %d %b %Y %H:%M:%S GMT"):
+        try:
+            return datetime.strptime(s[:25].strip(), fmt)
+        except:
+            pass
+    return datetime.min
+
+def dedupe(items):
+    seen, out = set(), []
+    for a in items:
+        k = a["title"][:70].lower()
+        if k not in seen:
+            seen.add(k)
+            out.append(a)
+    return out
+
+def score_articles(articles):
+    scores = []
+    with torch.no_grad():
+        for a in articles:
+            text = a["title"][:512]
+            inputs = tokenizer(text, return_tensors="pt", truncation=True, max_length=512)
+            logits = model(**inputs).logits[0]
+            probs = torch.softmax(logits, dim=-1)
+            idx = int(torch.argmax(probs).item())
+            label = ID2LABEL[idx]
+            conf = float(probs[idx].item())
+            a["sentiment"] = label
+            a["confidence"] = round(conf, 3)
+            a["score"] = SCORE_MAP[label]
+            scores.append(a["score"])
+    return articles, scores
+
+def is_market_hours():
+    now = datetime.now(IST)
+    return now.weekday() < 5 and now.replace(hour=9, minute=15, second=0) <= now <= now.replace(hour=15, minute=30, second=0)
+
+def load_all():
+    raw = fetch_newsapi() + fetch_finnhub() + fetch_rss() + fetch_freenews()
+    raw = dedupe(raw)
+    raw.sort(key=lambda x: parse_date(x.get("published", "")), reverse=True)
+    return raw[:60]
+
+def refresh_logic():
+    arts = load_all()
+    arts, scores = score_articles(arts)
+    avg = round(sum(scores) / len(scores), 3) if scores else 0.0
+    if avg > 0.15:
+        overall = "Bullish"
+    elif avg < -0.15:
+        overall = "Bearish"
+    else:
+        overall = "Neutral"
+    return arts, avg, overall
+
+if "prev_score" not in st.session_state:
+    st.session_state.prev_score = 0.0
+    st.session_state.prev_sentiment = None
+    st.session_state.articles = []
+    st.session_state.avg_score = 0.0
+    st.session_state.overall = "Neutral"
+
+if "owner_ok" not in st.session_state:
+    st.session_state.owner_ok = False
+
+interval_ms = 10 * 60 * 1000 if is_market_hours() else 30 * 60 * 1000
+st_autorefresh(interval=interval_ms, key="refresh_timer")
+
+with st.sidebar:
+    st.markdown("## Owner Mode")
+    pwd = st.text_input("Password", type="password")
+    if st.button("Unlock"):
+        st.session_state.owner_ok = bool(OWNER_PASSWORD) and pwd == OWNER_PASSWORD
+    if st.session_state.owner_ok:
+        st.success("Owner mode enabled")
+        if st.button("Manual Refresh"):
+            st.cache_data.clear()
+            arts, avg, overall = refresh_logic()
+            delta = round(avg - st.session_state.prev_score, 3)
+            if st.session_state.prev_sentiment and overall != st.session_state.prev_sentiment:
+                change = f"{st.session_state.prev_sentiment} → {overall} ({delta:+.3f})"
+            else:
+                change = f"{delta:+.3f}"
+            st.session_state.articles = arts
+            st.session_state.avg_score = avg
+            st.session_state.overall = overall
+            st.session_state.change = change
+            st.session_state.prev_score = avg
+            st.session_state.prev_sentiment = overall
+            st.rerun()
+    else:
+        st.info("Read-only mode")
+
 st.markdown("""
 <style>
-  [data-testid="stAppViewContainer"] { background: #0d1117; color: #e6edf3; }
-  [data-testid="stSidebar"] { background: #161b22; border-right: 1px solid #30363d; }
-  .block-container { padding-top: 1rem; }
-
-  .sent-box { border-radius: 12px; padding: 20px; text-align: center;
-              margin-bottom: 12px; border: 2px solid; }
-  .sent-bull { background:#0d2b1f; border-color:#3fb950; }
-  .sent-bear { background:#2a1010; border-color:#f85149; }
-  .sent-neut { background:#2a2210; border-color:#d29922; }
-  .sent-label-bull { font-size:2rem; font-weight:800; color:#3fb950; }
-  .sent-label-bear { font-size:2rem; font-weight:800; color:#f85149; }
-  .sent-label-neut { font-size:2rem; font-weight:800; color:#d29922; }
-
-  .news-card { background:#161b22; border:1px solid #30363d; border-radius:10px;
-               padding:12px 16px; margin-bottom:8px; border-left:4px solid; }
-  .card-bull { border-left-color:#3fb950; }
-  .card-bear { border-left-color:#f85149; }
-  .card-neut { border-left-color:#d29922; }
-
-  .badge { display:inline-block; font-size:.72rem; font-weight:700;
-           padding:2px 8px; border-radius:10px; margin-right:6px; }
-  .badge-bull { background:#0d2b1f; color:#3fb950; border:1px solid #1e4731; }
-  .badge-bear { background:#2a1010; color:#f85149; border:1px solid #5a1f1f; }
-  .badge-neut { background:#2a2210; color:#d29922; border:1px solid #5a4820; }
-
-  .feed-tag { font-size:.68rem; background:#21262d; color:#8b949e;
-              padding:2px 7px; border-radius:4px; border:1px solid #30363d; }
-  .meta-row  { font-size:.75rem; color:#8b949e; margin-top:4px; }
-  .headline  { font-size:.9rem; font-weight:500; color:#e6edf3; }
-  .change-box { background:#1c2128; border:1px solid #30363d; border-radius:8px;
-                padding:10px 14px; font-size:.82rem; color:#8b949e; margin-bottom:12px; }
+  .stApp { background: white; color: #111; }
+  [data-testid="stSidebar"] { background: #fafafa; border-right: 1px solid #e5e7eb; }
+  .card { background: white; border: 1px solid #e5e7eb; border-left-width: 5px; border-radius: 12px; padding: 14px 16px; margin-bottom: 10px; }
+  .bull { border-left-color: #22c55e; }
+  .bear { border-left-color: #ef4444; }
+  .neut { border-left-color: #f59e0b; }
+  .badge { display:inline-block; padding: 2px 8px; border-radius: 999px; font-size: 12px; font-weight: 700; }
+  .badge-bull { background:#ecfdf5; color:#15803d; }
+  .badge-bear { background:#fef2f2; color:#b91c1c; }
+  .badge-neut { background:#fffbeb; color:#b45309; }
+  a { text-decoration: none; }
 </style>
 """, unsafe_allow_html=True)
 
-# ── Market hours check ────────────────────────────────────────────────────────
-def is_market_hours():
-    now = datetime.now(IST)
-    return now.weekday() < 5 and (
-        now.replace(hour=9, minute=15, second=0) <= now <=
-        now.replace(hour=15, minute=30, second=0)
-    )
+if not st.session_state.articles:
+    with st.spinner("Loading latest news..."):
+        arts, avg, overall = refresh_logic()
+        st.session_state.articles = arts
+        st.session_state.avg_score = avg
+        st.session_state.overall = overall
+        st.session_state.change = "Initial load"
+        st.session_state.prev_score = avg
+        st.session_state.prev_sentiment = overall
 
-interval_ms = 10 * 60 * 1000 if is_market_hours() else 30 * 60 * 1000
-interval_label = "10 min (Market Hours)" if is_market_hours() else "30 min (Off-Hours)"
+articles = st.session_state.articles
+avg = st.session_state.avg_score
+overall = st.session_state.overall
 
-# ── Auto-refresh ──────────────────────────────────────────────────────────────
-st_autorefresh(interval=interval_ms, key="auto_refresh")  # [web:48][web:52]
+bull = [a for a in articles if a["sentiment"] == "positive"]
+bear = [a for a in articles if a["sentiment"] == "negative"]
+neut = [a for a in articles if a["sentiment"] == "neutral"]
 
-# ── Session state for sentiment history ──────────────────────────────────────
-if "prev_sentiment" not in st.session_state:
-    st.session_state.prev_sentiment = None
-    st.session_state.prev_score     = 0.0
+st.title("Nifty Sentiment Monitor")
+st.caption(f"Auto-refresh: {'10 min' if is_market_hours() else '30 min'} | Mode: {'Owner' if st.session_state.owner_ok else 'Read-only'}")
 
-# ── Data load with spinner ────────────────────────────────────────────────────
-@st.cache_data(ttl=600, show_spinner=False)
-def load_data():
-    articles = fetch_all()
-    return score_articles(articles)
+c1, c2, c3 = st.columns(3)
+c1.metric("Overall", overall)
+c2.metric("Score", f"{avg:+.3f}")
+c3.metric("Change", st.session_state.get("change", "—"))
 
-with st.spinner("🔄 Fetching & scoring news with FinBERT..."):
-    articles = load_data()
+st.write("### Latest Headlines")
 
-# ── Compute overall sentiment ─────────────────────────────────────────────────
-scores = [a["score"] for a in articles]
-avg    = round(sum(scores) / len(scores), 3) if scores else 0.0
-if avg > 0.15:    overall = "Bullish"
-elif avg < -0.15: overall = "Bearish"
-else:             overall = "Neutral"
-
-delta = round(avg - st.session_state.prev_score, 3)
-if st.session_state.prev_sentiment is None:
-    change_str = "Initial load"
-elif overall != st.session_state.prev_sentiment:
-    arrow = "▲" if delta > 0 else "▼"
-    change_str = f"{st.session_state.prev_sentiment} → {overall} ({arrow}{abs(delta):.3f})"
-elif abs(delta) > 0.005:
-    arrow = "▲" if delta > 0 else "▼"
-    change_str = f"Unchanged label ({arrow}{abs(delta):.3f})"
-else:
-    change_str = "No significant change"
-
-st.session_state.prev_sentiment = overall
-st.session_state.prev_score     = avg
-
-# ── Breakdown counts ──────────────────────────────────────────────────────────
-bull_arts = [a for a in articles if a["sentiment"] == "positive"]
-bear_arts = [a for a in articles if a["sentiment"] == "negative"]
-neut_arts = [a for a in articles if a["sentiment"] == "neutral"]
-total     = len(articles) or 1
-
-# ── SIDEBAR ───────────────────────────────────────────────────────────────────
-with st.sidebar:
-    st.markdown("## 📈 Nifty Sentiment")
-
-    box_cls   = {"Bullish":"sent-bull","Bearish":"sent-bear","Neutral":"sent-neut"}[overall]
-    label_cls = {"Bullish":"sent-label-bull","Bearish":"sent-label-bear","Neutral":"sent-label-neut"}[overall]
-    st.markdown(f"""
-    <div class="sent-box {box_cls}">
-      <div class="{label_cls}">{overall}</div>
-      <div style="color:#8b949e;font-size:.85rem">Score: {avg:+.3f}</div>
-    </div>""", unsafe_allow_html=True)
-
-    st.markdown(f"""
-    <div class="change-box">
-      🔄 <b>Change:</b> {change_str}
-    </div>""", unsafe_allow_html=True)
-
-    # Gauge bar
-    pct = int((avg + 1) / 2 * 100)
-    st.markdown("**Sentiment Gauge**")
-    st.markdown(f"""
-    <div style="height:10px;border-radius:5px;background:linear-gradient(to right,#f85149,#555,#3fb950);position:relative;margin-bottom:16px">
-      <div style="width:12px;height:12px;background:#fff;border-radius:50%;position:absolute;top:-1px;left:{pct}%;transform:translateX(-50%)"></div>
-    </div>
-    <div style="display:flex;justify-content:space-between;font-size:.7rem;color:#8b949e;margin-top:-12px;margin-bottom:16px">
-      <span>Bearish</span><span>Neutral</span><span>Bullish</span>
-    </div>""", unsafe_allow_html=True)
-
-    # Breakdown metrics
-    c1, c2, c3 = st.columns(3)
-    c1.metric("🟢 Bull", len(bull_arts))
-    c2.metric("🟡 Neut", len(neut_arts))
-    c3.metric("🔴 Bear", len(bear_arts))
-
-    st.progress(len(bull_arts) / total, text=f"Bullish {len(bull_arts)/total*100:.0f}%")
-    st.progress(len(neut_arts) / total, text=f"Neutral {len(neut_arts)/total*100:.0f}%")
-    st.progress(len(bear_arts) / total, text=f"Bearish {len(bear_arts)/total*100:.0f}%")
-
-    st.divider()
-
-    market_status = "🟢 Market Open" if is_market_hours() else "🔴 Market Closed"
-    st.markdown(f"**{market_status}**")
-    st.caption(f"Auto-refresh: **{interval_label}**")
-    st.caption(f"Last loaded: **{datetime.now(IST).strftime('%d %b %Y, %H:%M:%S IST')}**")
-    st.caption(f"Articles analysed: **{len(articles)}**")
-
-    st.divider()
-    if st.button("🔄 Manual Refresh", use_container_width=True):
-        st.cache_data.clear()
-        st.rerun()
-
-# ── MAIN PANEL ────────────────────────────────────────────────────────────────
-st.markdown("### 📰 Latest Headlines")
-
-tab_all, tab_bull, tab_neut, tab_bear, tab_rss, tab_fin = st.tabs([
+tabs = st.tabs([
     f"All ({len(articles)})",
-    f"🟢 Bullish ({len(bull_arts)})",
-    f"🟡 Neutral ({len(neut_arts)})",
-    f"🔴 Bearish ({len(bear_arts)})",
-    "📡 RBI/PIB/RSS",
-    "📊 Finnhub"
+    f"Bullish ({len(bull)})",
+    f"Neutral ({len(neut)})",
+    f"Bearish ({len(bear)})"
 ])
 
-def render_articles(arts):
-    if not arts:
-        st.info("No articles in this category.")
-        return
-    for a in arts:
-        s   = a["sentiment"]
-        cls = {"positive":"bull","negative":"bear","neutral":"neut"}[s]
-        icon = {"positive":"▲","negative":"▼","neutral":"●"}[s]
-        conf = int(a["confidence"] * 100)
-        pub  = a.get("published","")[:16].replace("T"," ")
+def render(items):
+    for a in items:
+        cls = "bull" if a["sentiment"] == "positive" else "bear" if a["sentiment"] == "negative" else "neut"
+        badge = "badge-bull" if cls == "bull" else "badge-bear" if cls == "bear" else "badge-neut"
+        icon = "▲" if cls == "bull" else "▼" if cls == "bear" else "●"
+        ts = a.get("published", "")[:19].replace("T", " ")
         st.markdown(f"""
-        <div class="news-card card-{cls}">
-          <a href="{a['url']}" target="_blank" class="headline">{a['title']}</a>
-          <div class="meta-row">
-            <span class="badge badge-{cls}">{icon} {s}</span>
-            <span class="feed-tag">{a['feed']}</span>
-            &nbsp;{a['source']}&nbsp;·&nbsp;🕐 {pub}&nbsp;·&nbsp;conf: {conf}%
-          </div>
-        </div>""", unsafe_allow_html=True)
+        <div class="card {cls}">
+          <a href="{a['url']}" target="_blank"><b>{a['title']}</b></a><br>
+          <span class="badge {badge}">{icon} {a['sentiment']}</span>
+          <span style="margin-left:8px;color:#6b7280">{a['source']} · {a['feed']} · {ts} · conf {int(a['confidence']*100)}%</span>
+        </div>
+        """, unsafe_allow_html=True)
 
-with tab_all:  render_articles(articles)
-with tab_bull: render_articles(bull_arts)
-with tab_neut: render_articles(neut_arts)
-with tab_bear: render_articles(bear_arts)
-with tab_rss:  render_articles([a for a in articles if a["feed"] == "RSS"])
-with tab_fin:  render_articles([a for a in articles if a["feed"] == "Finnhub"])
+with tabs[0]:
+    render(articles)
+with tabs[1]:
+    render(bull)
+with tabs[2]:
+    render(neut)
+with tabs[3]:
+    render(bear)
