@@ -26,15 +26,12 @@ tokenizer, model = load_model()
 SCORE_MAP = {"positive": 1.0, "neutral": 0.0, "negative": -1.0}
 ID2LABEL = {0: "negative", 1: "neutral", 2: "positive"}
 
-
 def now_ist():
     return datetime.now(IST)
-
 
 def fmt_ist(dt=None):
     dt = dt or now_ist()
     return dt.strftime("%d %b %Y, %I:%M %p IST")
-
 
 def parse_pub_dt(s):
     if not s:
@@ -49,11 +46,9 @@ def parse_pub_dt(s):
             pass
     return None
 
-
 def within_last_3_hours(article):
     dt = parse_pub_dt(article.get("published", ""))
     return dt is not None and dt >= now_ist() - timedelta(hours=3)
-
 
 @st.cache_data(ttl=300, show_spinner=False)
 def fetch_newsapi():
@@ -71,7 +66,6 @@ def fetch_newsapi():
         ]
     except:
         return []
-
 
 @st.cache_data(ttl=300, show_spinner=False)
 def fetch_finnhub():
@@ -95,7 +89,6 @@ def fetch_finnhub():
         return out
     except:
         return []
-
 
 @st.cache_data(ttl=300, show_spinner=False)
 def fetch_rss():
@@ -122,7 +115,6 @@ def fetch_rss():
             pass
     return results
 
-
 @st.cache_data(ttl=300, show_spinner=False)
 def fetch_freenews():
     try:
@@ -140,7 +132,6 @@ def fetch_freenews():
     except:
         return []
 
-
 def dedupe(items):
     seen, out = set(), []
     for a in items:
@@ -150,14 +141,12 @@ def dedupe(items):
             out.append(a)
     return out
 
-
 def load_all():
     raw = fetch_newsapi() + fetch_finnhub() + fetch_rss() + fetch_freenews()
     raw = dedupe(raw)
     raw = [a for a in raw if within_last_3_hours(a)]
     raw.sort(key=lambda x: parse_pub_dt(x.get("published", "")) or datetime.min.replace(tzinfo=IST), reverse=True)
     return raw[:60]
-
 
 def score_articles(articles):
     scored = []
@@ -175,7 +164,6 @@ def score_articles(articles):
             scored.append(a)
     return scored
 
-
 def refresh_logic():
     arts = score_articles(load_all())
     scores = [a["score"] for a in arts]
@@ -187,7 +175,6 @@ def refresh_logic():
     else:
         overall = "Neutral"
     return arts, avg, overall
-
 
 if "owner_ok" not in st.session_state:
     st.session_state.owner_ok = False
