@@ -832,25 +832,21 @@ if hot_news:
         icon   = "▲" if cls == "bull" else "▼" if cls == "bear" else "●"
         ts     = parse_pub_dt(a.get("published", ""))
         ts_txt = ts.strftime("%I:%M %p IST") if ts else "—"
-        override_badge = (
-            "<span class='badge badge-override' style='margin-left:6px;' "
-            "title='FinBERT overridden by rules engine'>⚡ rules</span>"
-            if a.get("scorer", "finbert") != "finbert" else ""
+        ovr    = ("<span class='badge badge-override' style='margin-left:6px;'"
+                  " title='FinBERT overridden'>⚡ rules</span>"
+                  if a.get("scorer", "finbert") != "finbert" else "")
+        # Single-line concatenation — no blank lines that confuse st.markdown
+        html = (
+            f'<div class="card {cls}" style="margin-bottom:6px;">'
+            f'<a href="{a["url"]}" target="_blank"><b>{a["title"]}</b></a><br>'
+            f'<span class="badge badge-{cls}">{icon} {a["sentiment"]}</span>'
+            f'<span class="badge badge-sector" style="margin-left:6px;">{a.get("sector","General")}</span>'
+            + ovr +
+            f'<span style="margin-left:8px;color:#6b7280">'
+            f'{a["source"]} · {ts_txt} · conf {int(a["confidence"]*100)}%'
+            f'</span></div>'
         )
-        st.markdown(
-            f"""<div class="card {cls}" style="margin-bottom:6px;">
-              <a href="{a['url']}" target="_blank"><b>{a['title']}</b></a><br>
-              <span class="badge badge-{cls}">{icon} {a['sentiment']}</span>
-              <span class="badge badge-sector" style="margin-left:6px;">
-                {a.get('sector','General')}
-              </span>
-              {override_badge}
-              <span style="margin-left:8px;color:#6b7280">
-                {a['source']} · {ts_txt} · conf {int(a['confidence']*100)}%
-              </span>
-            </div>""",
-            unsafe_allow_html=True,
-        )
+        st.markdown(html, unsafe_allow_html=True)
 
 # ── Features 3 & 5: Analytics charts row ─────────────────────────────────────
 
@@ -980,23 +976,21 @@ def render(items: list):
         ts     = parse_pub_dt(a.get("published", ""))
         ts_txt = ts.strftime("%d %b %Y, %I:%M %p IST") if ts else "Time unavailable"
         sector = a.get("sector", "General")
-        override_badge = (
-            "<span class='badge badge-override' style='margin-left:6px;' "
-            "title='FinBERT overridden by rules engine'>⚡ rules</span>"
-            if a.get("scorer", "finbert") != "finbert" else ""
+        ovr    = ("<span class='badge badge-override' style='margin-left:6px;'"
+                  " title='FinBERT overridden'>⚡ rules</span>"
+                  if a.get("scorer", "finbert") != "finbert" else "")
+        # Single-line concatenation — no blank lines that confuse st.markdown
+        html = (
+            f'<div class="card {cls}">'
+            f'<a href="{a["url"]}" target="_blank"><b>{a["title"]}</b></a><br>'
+            f'<span class="badge badge-{cls}">{icon} {a["sentiment"]}</span>'
+            f'<span class="badge badge-sector" style="margin-left:6px;">{sector}</span>'
+            + ovr +
+            f'<span style="margin-left:8px;color:#6b7280">'
+            f'{a["source"]} · {a["feed"]} · {ts_txt} · conf {int(a["confidence"]*100)}%'
+            f'</span></div>'
         )
-        st.markdown(
-            f"""<div class="card {cls}">
-              <a href="{a['url']}" target="_blank"><b>{a['title']}</b></a><br>
-              <span class="badge badge-{cls}">{icon} {a['sentiment']}</span>
-              <span class="badge badge-sector" style="margin-left:6px;">{sector}</span>
-              {override_badge}
-              <span style="margin-left:8px;color:#6b7280">
-                {a['source']} · {a['feed']} · {ts_txt} · conf {int(a['confidence']*100)}%
-              </span>
-            </div>""",
-            unsafe_allow_html=True,
-        )
+        st.markdown(html, unsafe_allow_html=True)
 
 with tabs[0]: render(filtered)
 with tabs[1]: render(f_bull)
