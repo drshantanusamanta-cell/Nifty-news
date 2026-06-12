@@ -44,7 +44,10 @@ def load_model():
 tokenizer, model = load_model()
 
 SCORE_MAP = {"positive": 1.0, "neutral": 0.0, "negative": -1.0}
-ID2LABEL  = {0: "negative", 1: "neutral", 2: "positive"}
+# ProsusAI/FinBERT config.json: {0: positive, 1: negative, 2: neutral}
+# Derived directly from the loaded model so it stays correct if the model
+# is ever swapped out.
+ID2LABEL  = {int(k): v for k, v in model.config.id2label.items()}
 
 # ── Feature 5: sector keyword map ────────────────────────────────────────────
 
