@@ -49,6 +49,98 @@ SCORE_MAP = {"positive": 1.0, "neutral": 0.0, "negative": -1.0}
 # is ever swapped out.
 ID2LABEL  = {int(k): v for k, v in model.config.id2label.items()}
 
+# ── Free rules-based override layer ──────────────────────────────────────────
+# FinBERT was trained on company-level text and mis-scores geopolitical /
+# macro headlines because conflict vocabulary dominates sentiment cues.
+# e.g. "Street indexes jump, Trump says strikes against Iran canceled"
+#      → FinBERT sees "strikes"+"Iran" and outputs negative.
+#
+# Fix (no API needed, no cost): scan the headline for unambiguous market-
+# direction phrases AFTER FinBERT scores it.  If a strong override phrase is
+# present, replace FinBERT's label.  The "scorer" field records what happened
+# so the UI can badge overridden headlines with a ⚡ marker.
+#
+# Design notes:
+#  • Only MULTI-WORD or unambiguous phrases are used — single words like
+#    "fall" or "rise" are too noisy on their own.
+#  • Phrases are matched on word boundaries (space/start/end) to avoid
+#    accidental substring hits.
+#  • BULL phrases take priority over BEAR phrases if both somehow appear
+#    (rare, but possible in mixed headlines like "indexes jump despite crash fears").
+
+import re as _re
+
+def _wb(phrase: str) -> _re.Pattern:
+    """Compile a word-boundary-aware regex for a phrase."""
+    return _re.compile(r'(?<!\w)' + _re.escape(phrase) + r'(?!\w)', _re.IGNORECASE)
+
+# ── BULLISH override phrases ──────────────────────────────────────────────────
+_BULL_PHRASES: list[_re.Pattern] = [p for p in map(_wb, [
+    # explicit index / market direction
+    "indexes jump", "indices jump", "index jumps", "market jumps",
+    "stocks jump", "shares jump", "markets rally", "market rallies",
+    "indexes rise", "indices rise", "stocks rise", "shares rise",
+    "indexes surge", "indices surge", "stocks surge", "shares surge",
+    "market surges", "indexes gain", "indices gain", "stocks gain",
+    "bull run", "market up", "stocks up", "broad rally",
+    "record high", "all-time high", "52-week high", "multi-year high",
+    "strong rally", "sharp rally", "market bounces", "stocks bounce",
+    # de-escalation / deal keywords
+    "strikes canceled", "strikes called off", "attack canceled",
+    "ceasefire", "peace deal", "trade deal signed", "deal reached",
+    "sanctions lifted", "tensions ease", "de-escalation",
+    "war averted", "conflict averted", "crisis averted",
+    # monetary / policy tailwind
+    "rate cut", "rate cuts", "rates cut", "interest rate cut",
+    "stimulus approved", "stimulus package", "bailout approved",
+    "fed pivots", "rbi rate cut", "dovish",
+    # corporate positive
+    "beats estimates", "beats expectations", "earnings beat",
+    "strong earnings", "record profit", "order win", "contract win",
+    "merger approved", "acquisition approved", "strong guidance",
+    "upgrade to buy", "price target raised",
+])]
+
+# ── BEARISH override phrases ──────────────────────────────────────────────────
+_BEAR_PHRASES: list[_re.Pattern] = [p for p in map(_wb, [
+    # explicit index / market direction
+    "indexes fall", "indices fall", "stocks fall", "shares fall",
+    "market falls", "indexes crash", "stocks crash", "market crashes",
+    "indexes plunge", "stocks plunge", "shares plunge", "market plunges",
+    "indexes tumble", "stocks tumble", "indices tumble",
+    "sell-off", "selloff", "broad sell-off",
+    "circuit breaker", "trading halt", "lower circuit",
+    "record low", "52-week low", "multi-year low",
+    # escalation / negative macro
+    "war declared", "military strike", "invasion begins",
+    "sanctions imposed", "trade war escalates",
+    "rate hike", "rates hiked", "hawkish surprise",
+    "recession confirmed", "recession fears", "stagflation",
+    # corporate negative
+    "misses estimates", "misses expectations", "earnings miss",
+    "profit warning", "guidance cut", "downgrade to sell",
+    "price target cut", "layoffs", "job cuts", "bankruptcy",
+    "default risk", "insolvency",
+])]
+
+def rules_override(title: str, finbert_label: str) -> tuple[str, str]:
+    """
+    Check title against override phrase lists.
+    Returns (final_label, scorer) where scorer is:
+      'finbert'       — no override triggered
+      'rules-bull'    — bullish override applied
+      'rules-bear'    — bearish override applied
+    """
+    tl = title.lower()
+    # Bull phrases take priority (de-escalation + market jump combo)
+    for pat in _BULL_PHRASES:
+        if pat.search(tl):
+            return "positive", "rules-bull"
+    for pat in _BEAR_PHRASES:
+        if pat.search(tl):
+            return "negative", "rules-bear"
+    return finbert_label, "finbert"
+
 # ── Feature 5: sector keyword map ────────────────────────────────────────────
 
 SECTOR_KEYWORDS = {
@@ -392,40 +484,52 @@ BATCH_SIZE = 16   # tune up if you have more RAM; 16 is safe on 2 GB
 
 def score_articles(articles: list) -> list:
     """
-    Batch FinBERT inference instead of one headline at a time.
-    Batching reduces wall-clock scoring time by ~8-10× on CPU
-    (e.g. 150 articles: ~15 s → ~1.5–2 s).
+    Two-pass scoring — entirely free, no external API:
+
+    Pass 1 — FinBERT batch inference (unchanged from original).
+    Pass 2 — rules_override(): scans each headline for unambiguous
+              market-direction phrases and replaces FinBERT's label when
+              a match is found.  The 'scorer' field records which pass
+              produced the final label so the UI can badge overrides.
     """
     titles  = [a["title"][:512] for a in articles]
-    results = []   # (label, conf) per article
+    results = []   # (label, conf, scorer) per article
 
     with torch.no_grad():
         for i in range(0, len(titles), BATCH_SIZE):
-            batch = titles[i : i + BATCH_SIZE]
+            batch  = titles[i : i + BATCH_SIZE]
             inputs = tokenizer(
                 batch,
                 return_tensors="pt",
                 truncation=True,
-                max_length=128,      # 128 is sufficient for short headlines;
-                padding=True,        # full 512 wastes compute on news titles
+                max_length=128,
+                padding=True,
             )
-            logits = model(**inputs).logits          # (batch, 3)
-            probs  = torch.softmax(logits, dim=-1)   # (batch, 3)
-            idxs   = torch.argmax(probs, dim=-1)     # (batch,)
+            logits = model(**inputs).logits
+            probs  = torch.softmax(logits, dim=-1)
+            idxs   = torch.argmax(probs, dim=-1)
             for j in range(len(batch)):
                 idx   = int(idxs[j].item())
                 label = ID2LABEL[idx]
                 conf  = float(probs[j][idx].item())
-                results.append((label, round(conf, 3)))
+                results.append([label, round(conf, 3), "finbert"])
 
+    # ── Pass 2: free rules-based override ────────────────────────────────────
+    for i, (title, (label, conf, _)) in enumerate(zip(titles, results)):
+        final_label, scorer = rules_override(title, label)
+        if scorer != "finbert":               # override fired
+            results[i] = [final_label, conf, scorer]
+
+    # ── Assemble final article dicts ──────────────────────────────────────────
     scored = []
-    for a, (label, conf) in zip(articles, results):
+    for a, (label, conf, scorer) in zip(articles, results):
         scored.append({
             **a,
             "sentiment":  label,
             "confidence": conf,
             "score":      SCORE_MAP[label],
             "sector":     tag_sector(a["title"]),
+            "scorer":     scorer,
         })
     return scored
 
@@ -663,6 +767,7 @@ st.markdown("""
   .badge-bear   { background: #fef2f2; color: #b91c1c; }
   .badge-neut   { background: #fffbeb; color: #b45309; }
   .badge-sector { background: #f0f9ff; color: #0369a1; }
+  .badge-override { background: #fefce8; color: #854d0e; }
 </style>
 """, unsafe_allow_html=True)
 
@@ -727,6 +832,11 @@ if hot_news:
         icon   = "▲" if cls == "bull" else "▼" if cls == "bear" else "●"
         ts     = parse_pub_dt(a.get("published", ""))
         ts_txt = ts.strftime("%I:%M %p IST") if ts else "—"
+        override_badge = (
+            "<span class='badge badge-override' style='margin-left:6px;' "
+            "title='FinBERT overridden by rules engine'>⚡ rules</span>"
+            if a.get("scorer", "finbert") != "finbert" else ""
+        )
         st.markdown(
             f"""<div class="card {cls}" style="margin-bottom:6px;">
               <a href="{a['url']}" target="_blank"><b>{a['title']}</b></a><br>
@@ -734,6 +844,7 @@ if hot_news:
               <span class="badge badge-sector" style="margin-left:6px;">
                 {a.get('sector','General')}
               </span>
+              {override_badge}
               <span style="margin-left:8px;color:#6b7280">
                 {a['source']} · {ts_txt} · conf {int(a['confidence']*100)}%
               </span>
@@ -869,11 +980,17 @@ def render(items: list):
         ts     = parse_pub_dt(a.get("published", ""))
         ts_txt = ts.strftime("%d %b %Y, %I:%M %p IST") if ts else "Time unavailable"
         sector = a.get("sector", "General")
+        override_badge = (
+            "<span class='badge badge-override' style='margin-left:6px;' "
+            "title='FinBERT overridden by rules engine'>⚡ rules</span>"
+            if a.get("scorer", "finbert") != "finbert" else ""
+        )
         st.markdown(
             f"""<div class="card {cls}">
               <a href="{a['url']}" target="_blank"><b>{a['title']}</b></a><br>
               <span class="badge badge-{cls}">{icon} {a['sentiment']}</span>
               <span class="badge badge-sector" style="margin-left:6px;">{sector}</span>
+              {override_badge}
               <span style="margin-left:8px;color:#6b7280">
                 {a['source']} · {a['feed']} · {ts_txt} · conf {int(a['confidence']*100)}%
               </span>
